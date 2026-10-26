@@ -66,9 +66,9 @@ type schemaGenerator struct {
 	schemaTypesByRef map[string]*schemas.Type
 }
 
-func (g *schemaGenerator) generateRootType() error {
+func (g *schemaGenerator) generateRootType() (*codegen.TypeDecl, error) {
 	if g.schema.ObjectAsType == nil {
-		return errSchemaHasNoRoot
+		return nil, errSchemaHasNoRoot
 	}
 
 	for _, name := range sortDefinitionsByName(g.schema.Definitions) {
@@ -76,7 +76,7 @@ func (g *schemaGenerator) generateRootType() error {
 
 		_, err := g.generateDeclaredType(def, newNameScope(g.caser.Identifierize(name)))
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -87,22 +87,34 @@ func (g *schemaGenerator) generateRootType() error {
 	// only when the root is structurally empty (e.g. `{}` or a schema that
 	// declares only metadata like `$schema`/`$id`).
 	if !rootHasGeneratable(root) {
-		return nil
+		return nil, nil //nolint:nilnil // A structurally empty root has no declaration.
 	}
 
 	rootTypeName := g.getRootTypeName(g.schema, g.schemaFileName)
-	if _, ok := g.output.declsByName[rootTypeName]; ok {
-		return nil
+	if decl, ok := g.output.declsByName[rootTypeName]; ok {
+		// A referencing property reserves its path-derived name before it
+		// resolves the ref. When that name is also this file's root name, the
+		// reservation is not the root's declaration: release it so root
+		// generation can own the name, and the reservation is forgotten when
+		// the ref resolves to the root.
+		if decl.Type != nil || decl.SchemaType == root {
+			return decl, nil
+		}
+
+		delete(g.output.declsByName, rootTypeName)
 	}
 
 	root, err := constRootAsEnum(root)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	_, err = g.generateDeclaredType(root, newNameScope(rootTypeName))
+	dt, err := g.generateDeclaredType(root, newNameScope(rootTypeName))
+	if err != nil {
+		return nil, err
+	}
 
-	return err
+	return namedDecl(dt), nil
 }
 
 // constRootAsEnum returns a root that is only a primitive `const`, explicit
@@ -201,6 +213,8 @@ func (g *schemaGenerator) generateReferencedType(t *schemas.Type) (codegen.Type,
 	schema := g.schema
 	sg := g
 
+	var rootDecl *codegen.TypeDecl
+
 	if fileName != "" {
 		var serr error
 
@@ -214,7 +228,10 @@ func (g *schemaGenerator) generateReferencedType(t *schemas.Type) (codegen.Type,
 			return nil, fmt.Errorf("could not resolve qualified file name for %s: %w", fileName, qerr)
 		}
 
-		if ferr := g.AddFile(qualified, schema); ferr != nil {
+		var ferr error
+
+		rootDecl, ferr = g.addFile(qualified, schema)
+		if ferr != nil {
 			return nil, ferr
 		}
 
@@ -226,25 +243,9 @@ func (g *schemaGenerator) generateReferencedType(t *schemas.Type) (codegen.Type,
 		sg = newSchemaGenerator(g.Generator, schema, qualified, output)
 	}
 
-	var def *schemas.Type
-
-	if defName != "" {
-		var rerr error
-
-		def, rerr = resolveRefPath(schema.Definitions, defName)
-		if rerr != nil {
-			return nil, fmt.Errorf("%w: %q (from ref %q)", rerr, defName, t.Ref)
-		}
-
-		defName = sg.avoidInProgressName(t, def, g.caser.Identifierize(refPathTypeName(defName)))
-	} else {
-		def = (*schemas.Type)(schema.ObjectAsType)
-		defName = g.getRootTypeName(schema, fileName)
-
-		if len(def.Type) == 0 {
-			// Minor hack to make definitions default to being objects.
-			def.Type = schemas.TypeList{schemas.TypeNameObject}
-		}
+	def, defName, err := g.referencedDefinition(t, defName, schema, sg, rootDecl, fileName)
+	if err != nil {
+		return nil, err
 	}
 
 	isCycle, cleanupCycle, cycleErr := g.detectCycle(t)
@@ -310,6 +311,49 @@ func (g *schemaGenerator) generateReferencedType(t *schemas.Type) (codegen.Type,
 	}
 
 	return ref, nil
+}
+
+// referencedDefinition resolves the schema a reference points at and the name
+// its declaration should use. For a whole-file reference, addFile has already
+// generated the root; rootDecl is that declaration, or nil when the root
+// declares nothing generatable, and its schema is used in case normalization
+// or composition produced a copy.
+func (g *schemaGenerator) referencedDefinition(
+	t *schemas.Type,
+	defName string,
+	schema *schemas.Schema,
+	sg *schemaGenerator,
+	rootDecl *codegen.TypeDecl,
+	fileName string,
+) (*schemas.Type, string, error) {
+	if defName != "" {
+		def, err := resolveRefPath(schema.Definitions, defName)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: %q (from ref %q)", err, defName, t.Ref)
+		}
+
+		name := sg.avoidInProgressName(t, def, g.caser.Identifierize(refPathTypeName(defName)))
+
+		return def, name, nil
+	}
+
+	def := (*schemas.Type)(schema.ObjectAsType)
+	name := g.getRootTypeName(schema, fileName)
+
+	switch {
+	case rootDecl != nil && rootDecl.SchemaType != nil:
+		// addFile already generated this file's root. Generate from the schema
+		// that declaration belongs to: enum and const normalization and
+		// composition may have produced a copy.
+		def = rootDecl.SchemaType
+
+	case len(def.Type) == 0 && !rootHasGeneratable(def):
+		// Preserve the historical fallback for a file root that declares
+		// nothing: a whole-file reference to {} is still a map.
+		def.Type = schemas.TypeList{schemas.TypeNameObject}
+	}
+
+	return def, name, nil
 }
 
 func (g *schemaGenerator) extractRefNames(t *schemas.Type) (string, string, error) {
